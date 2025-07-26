@@ -1,0 +1,190 @@
+*This is trash. Did not work, but here for clarity. Today is July 25, 2025.
+
+cd "/Users/josephthoburn/Desktop/Manufactured Housing Loans"
+
+import excel "/Users/josephthoburn/Desktop/Manufactured Housing Loans/subprime_2006_distributed.xls", sheet("1995") cellrange(A3:E121) firstrow
+rename CODE agency_code
+gen respondent_id = substr(IDD, 2, .)
+drop in 118
+drop in 117
+save "key_1995.dta", replace
+clear
+
+*1995
+import delimited "HMDA_LAR_1995.txt", clear
+keep if loan_purpose == 1 & action_taken == 1 & occupancy_type == 1
+tostring state_code, replace force format(%02.0f)
+tostring county_code, replace force format(%03.0f)
+tostring agency_code, replace force
+merge m:1 agency_code respondent_id using "key.dta"
+gen mh_specialist = (MH==2)
+drop _merge 
+// 1. Dade County, FL (rename 086 → 025) (happened in 1997)
+replace county_code = "086" if state_code == "12" & county_code == "025"
+// 2. South Boston City, VA (county 780) → Halifax County (083) (happened in 1995)
+replace county_code = "083" if state_code == "51" & county_code == "780"
+// 3. Clifton Forge City, VA (560) → Alleghany County (005) (happened in 2001)
+replace county_code = "005" if state_code == "51" & county_code == "560"
+merge m:1 state_code county_code using "fipscode_2010.dta"
+drop if _merge!=3
+drop _merge 
+tab mh_specialist
+replace MH = 0 if MH != 1 & MH != 2
+tab MH
+destring loan_amount, replace force
+save "HMDA_1995.dta", replace
+use "HMDA_1995.dta"
+collapse (count) num_originations = loan_amount ///
+         (sum) total_loan_amount = loan_amount, ///
+         by(state_code county_code mh_specialist)
+gen YEAR = 1995
+save "HMDA_1995_county.dta", replace
+
+preserve
+    keep if mh_specialist == 1
+    rename total_loan_amount mh_loan_amt
+    keep state_code county_code mh_loan_amt
+    tempfile mh
+    save `mh'
+restore
+
+collapse (sum) total_loan_amt = total_loan_amount, by(state_code county_code)
+
+merge 1:1 state_code county_code using `mh'
+
+replace mh_loan_amt = 0 if missing(mh_loan_amt)
+
+gen mh_lender_share = mh_loan_amt / total_loan_amt
+
+gen treat_binary = (mh_lender_share > 0.20)
+
+gen geo_fips = state_code + county_code
+destring geo_fips, replace force
+drop _merge
+save "mh_treatment_vars_1995.dta", replace
+clear
+
+* Run the IPUMS do-file to load and format the data
+do usa_00008.do
+
+* Construct the Estimation Sample
+* Step 1: Filter the data according to the specified criteria
+
+*drop observation that do not contain a county fips code
+drop if countyfip == 0
+
+* Keep households with exactly one family
+keep if nfams == 1
+
+* Keep households with income exceeding FPL ($11,250)
+keep if hhincome > 11250
+
+* drop renters 
+drop if ownershp == 2 
+
+* Keep couple households (RELATE == 02 for at least one individual)
+gen couple_hh = (relate == 2)  // Spouse present
+bys serial year: egen has_spouse = max(couple_hh)
+keep if has_spouse == 1
+
+* Identify female spouse younger than 35
+gen female_spouse = (sex == 2 & inlist(relate, 1, 2))
+bys serial year: egen female_age = max(age * female_spouse)
+keep if female_age < 35 
+
+* Lives in state of origin
+gen is_head = (relate == 1)
+gen head_in_state = (statefip == bpl) if is_head
+bysort serial (is_head): egen hh_head_in_state = max(head_in_state)
+keep if hh_head_in_state == 1
+
+*------------------------------------------------------------*
+* STEP 2: Create variables for aggregation                  *
+*------------------------------------------------------------*
+
+* Manufactured home indicator
+gen manufactured_home = (unitsstr == 1)
+
+* New mortgage indicator
+gen new_mortgage = (mortgage == 3 & movedin == 1)
+
+* Married dummy (married spouse present or absent)
+gen married = inlist(marst, 1, 2)
+
+* Child age categories
+gen child_under1 = (relate == 3 & age <= 1)
+gen child_over1  = (relate == 3 & age > 1)
+
+* Identify household head (RELATE == 1)
+gen head = (inlist(relate, 1, 2) & sex == 1)
+bysort serial (head): egen head_age       = mean(age) if head
+bysort serial (head): egen head_race      = mean(race) if head
+bysort serial (head): egen head_ethnicity = mean(hispan) if head
+bysort serial (head): egen head_educ      = mean(educ) if head
+
+* Identify female spouse's age and education
+gen spouse = (inlist(relate, 1, 2) & sex == 2)
+bysort serial (spouse): egen spouse_age  = mean(age) if spouse
+bysort serial (spouse): egen spouse_educ = mean(educ) if spouse
+
+save "test.dta", replace
+
+*------------------------------------------------------------*
+* STEP 3: Collapse to household level                       *
+*------------------------------------------------------------*
+collapse (mean) manufactured_home new_mortgage head_age ///
+               spouse_age spouse_educ hhincome ///
+         (max) married ///
+         (sum) child_under1 child_over1 ///
+         (mean) bedrooms head_race head_ethnicity head_educ ///
+         (first) hhwt statefip countyfip puma, by(serial year)
+		 
+*Creating the summary tables
+gen geo_fips = statefip * 1000 + countyfip
+merge m:1 geo_fips using "mh_treatment_vars_1995.dta"
+drop if _merge!=3
+sum manufactured_home new_mortgage head_age head_educ spouse_age married hhincome child_under1 child_over1 bedrooms if treat_binary == 0
+sum manufactured_home new_mortgage head_age head_educ spouse_age married hhincome child_under1 child_over1 bedrooms if treat_binary == 1
+
+*------------------------------------------------------------*
+* STEP 4: Collapse to county-year level                     *
+*------------------------------------------------------------*
+collapse (mean) manufactured_home new_mortgage head_age ///
+                 spouse_age spouse_educ hhincome ///
+                 married child_under1 child_over1 ///
+                 bedrooms head_race head_ethnicity head_educ ///
+          (count) num_households=serial [aw=hhwt], by(geo_fips year)
+
+* merge in treatment data
+merge m:1 geo_fips using "mh_treatment_vars_1995.dta"
+drop if _merge!=3
+
+tab year
+tab treat_binary
+tab year if treat_binary == 1
+tab year if treat_binary == 0
+
+*small but valid
+
+gen post = (year > 2000)
+
+xtset geo_fips year
+
+xtreg new_mortgage post##i.treat_binary i.year, fe cluster(geo_fips)
+xtreg new_mortgage post##c.mh_lender_share i.year, fe cluster(geo_fips)
+xtreg new_mortgage post##c.mh_lender_share ///
+    head_age spouse_age spouse_educ hhincome ///
+    head_race head_ethnicity head_educ ///
+    , fe cluster(geo_fips)
+
+
+xtreg child_under1 post##i.treat_binary i.year, fe cluster(geo_fips)
+xtreg child_under1 post##c.mh_lender_share, cluster(geo_fips)
+xtreg child_under1 post##c.mh_lender_share ///
+    head_age spouse_age spouse_educ hhincome ///
+    head_race head_ethnicity head_educ ///
+    , cluster(geo_fips)
+	
+reg new_mortgage i.post##i.treat_binary##c.manufactured_home ///
+    [aw=num_households], cluster(geo_fips)
+sum mh_lender_share if treat_binary == 1
