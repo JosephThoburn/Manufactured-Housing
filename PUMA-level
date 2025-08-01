@@ -1,0 +1,353 @@
+cd "/Users/josephthoburn/Desktop/Manufactured Housing"
+*Here is a area weight crosswalk of 1990 PUMAs to 2010 PUMAs, created using QGIS. I could recalculate this using pop weights, but was teaching myself the software.
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/puma_crosswalk_weighted.csv", varnames(1) stringcols(1 2) 
+drop if weight == 0
+gen weight_check = weight
+bysort gismatch (puma_2): gen sum_weight = sum(weight)
+bysort gismatch (puma_2): gen tag = _n == _N
+
+* Keep only one row per group to check final total
+keep if tag
+keep gismatch sum_weight
+list if sum_weight > 1.01
+
+	
+*Step 1: Simplify the key for a manufactured housing loan. 
+clear
+
+tempfile master
+local first = 1
+
+forvalues y = 1993/2005 {
+    * Import the sheet
+    import excel "/Users/josephthoburn/Desktop/Manufactured Housing/subprime_2006_distributed.xls", ///
+        sheet("`y'") cellrange(A3) firstrow clear
+
+    * Convert MH to numeric if needed
+    capture confirm numeric variable MH
+    if _rc {
+        destring MH, replace force
+    }
+
+    * Keep only MH-specialist lenders
+    keep if MH == 2
+
+    * Standardize variable types
+    capture confirm string variable IDD
+    if _rc == 0 {
+        gen respondent_id = substr(IDD, 2, .)
+    }
+    else {
+        tostring IDD, gen(idd_str)
+        gen respondent_id = substr(idd_str, 2, .)
+        drop idd_str
+    }
+
+    rename CODE agency_code
+
+    * Only keep necessary variables
+    keep agency_code respondent_id MH
+
+    * Append
+    if `first' {
+        gen year = `y'
+        tempfile keymaster
+        save `keymaster'
+        local first = 0
+    }
+    else {
+        gen year = `y'
+        append using `keymaster'
+        save `keymaster', replace
+    }
+}
+
+* After loop ends, load and drop duplicates
+use `keymaster', clear
+duplicates drop respondent_id agency_code, force
+gen mh_specialist = 1
+save "mh_specialist_lenders.dta", replace
+clear
+*Awesome, concise code. Loops are so great. 
+
+*Step 2: Match Census Tracts to PUMAs, using the 2000 PUMA definition. 
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/geocorr2014_2521205229.csv", varnames(2) stringcols(1 2 3 4) 
+
+gen census_tract = countycode + substr(tract, 1, 4) + substr(tract, 6, 2)
+gsort census_tract -tracttopuma12allocationfactor
+bysort census_tract (tracttopuma12allocationfactor): keep if _n == 1
+duplicates report census_tract
+save "tract-puma.dta", replace
+clear
+
+*Step 3: Creat treatment group on the PUMA level. 
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/hmda_1990-2013_imputed.csv", stringcols(4 5 6 7 8)
+merge m:1 respondent_id agency_code using "mh_specialist_lenders.dta"
+
+replace mh_specialist = 0 if mh_specialist == .
+keep if year == 1995 
+drop _merge 
+
+merge m:1 census_tract using "tract-puma.dta"
+drop if _merge!=3
+drop _merge
+
+gen mh_value = loan_amount if mh_specialist == 1
+collapse (sum) mh_value total_value=loan_amount, by(statecode puma12)
+gen mh_share = mh_value / total_value
+gen treat_binary_20 = (mh_share >= 0.20)
+tab treat_binary_20
+gen treat_binary_10 = (mh_share >= 0.10)
+tab treat_binary_10
+gen treat_binary_05 = (mh_share >= 0.05)
+tab treat_binary_05
+gen puma = statecode + puma12
+destring puma, replace force
+save "puma_treatment_1995.dta", replace
+clear
+
+*Loan-level regression:
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/hmda_1990-2013_imputed.csv", stringcols(4 5 6 7 8)
+* Keep only the years 1995–2013
+keep if year >= 1995 & year <= 2013
+gen manufactured = (is_mfh_pred > 0.5)
+merge m:1 census_tract using "tract-puma.dta"
+drop if _merge!=3
+drop _merge
+
+merge m:1 statecode puma12 using "puma_treatment_1995.dta"
+drop if _merge!=3
+drop _merge 
+
+reg manufactured ib2000.year##i.treat_binary_05 income, vce(cluster puma)
+ssc install coefplot, replace
+estimates store eventstudy
+
+coefplot eventstudy, ///
+    keep(*.treat_binary_05) ///
+    drop(_cons income 1.treat_binary_05) ///
+    vertical ///
+    xline(6, lpattern(dash)) ///
+    title("Effect of MH Credit Collapse on MH Loan Probability") ///
+    ytitle("Effect on MH loan share") ///
+    xlabel(1 "1995" 2 "1996" 3 "1997" 4 "1998" 5 "1999" 6 "2000" ///
+           7 "2001" 8 "2002" 9 "2003" 10 "2004" 11 "2005" 12 "2006" ///
+           13 "2007" 14 "2008" 15 "2009" 16 "2010" 17 "2011" 18 "2012" 19 "2013") ///
+    ciopts(recast(rcap) lwidth(medthin))
+	
+save "loan-level.dta", replace
+clear
+*PUMA-level regression:
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/hmda_1990-2013_imputed.csv", stringcols(4 5 6 7 8)
+merge m:1 respondent_id agency_code using "mh_specialist_lenders.dta"
+replace mh_specialist = 0 if mh_specialist == .
+drop _merge 
+merge m:1 census_tract using "tract-puma.dta"
+drop if _merge!=3
+drop _merge
+
+gen puma = state_code + puma12
+destring puma, replace force 
+
+gen mh_value = loan_amount if mh_specialist == 1
+collapse (count) total_loans = loan_amount (median) income ///
+         (sum) mh_loans = mh_specialist, by(puma year)
+gen ln_total_loans = log(total_loans)
+gen ln_mh_loans = log(mh_loans)
+
+merge m:1 puma using "puma_treatment_1995.dta"
+drop if _merge!=3
+drop _merge
+
+keep if year >= 1995 & year <= 2013
+xtset puma year
+xtreg ln_mh_loans ib2000.year##i.treat_binary_05 income, vce(cluster puma)
+estimates store mhreg
+coefplot mhreg, ///
+    keep(*.treat_binary_05) ///
+    drop(_cons 1.treat_binary_05) ///
+    vertical ///
+    xline(6, lpattern(dash) lcolor(black)) ///
+    yline(0, lcolor(gs8)) ///
+    title("Event Study: Effect on Log MH Loans in Treated PUMAs") ///
+    ytitle("Log point change in MH loans (vs. 2000)") ///
+    xlabel(1 "1995" 2 "1996" 3 "1997" 4 "1998" 5 "1999" ///
+           6 "2000" 7 "2001" 8 "2002" 9 "2003" 10 "2004" ///
+           11 "2005" 12 "2006" 13 "2007" 14 "2008" 15 "2009" ///
+           16 "2010" 17 "2011" 18 "2012" 19 "2013", angle(45)) ///
+    ciopts(recast(rcap) lwidth(medthin))
+
+xtreg ln_total_loans ib2000.year##i.treat_binary_05 income, vce(cluster puma)
+estimates store totalreg
+coefplot totalreg, ///
+    keep(*.treat_binary_05) ///
+    drop(_cons 1.treat_binary_05) ///
+    vertical ///
+    xline(6, lpattern(dash) lcolor(black)) ///
+    yline(0, lcolor(gs8)) ///
+    title("Event Study: Effect on Log Total Loans in Treated PUMAs") ///
+    ytitle("Log point change in total loans (vs. 2000)") ///
+    xlabel(1 "1995" 2 "1996" 3 "1997" 4 "1998" 5 "1999" ///
+           6 "2000" 7 "2001" 8 "2002" 9 "2003" 10 "2004" ///
+           11 "2005" 12 "2006" 13 "2007" 14 "2008" 15 "2009" ///
+           16 "2010" 17 "2011" 18 "2012" 19 "2013", angle(45)) ///
+    ciopts(recast(rcap) lwidth(medthin))
+
+save "puma-level.dta", replace
+clear
+
+*Crosswalk to match 2000 PUMAs to 2012 PUMAs
+import delimited "/Users/josephthoburn/Desktop/Manufactured Housing/puma2k_puma2010.csv", varnames(2) stringcols (1 2 3 6) 
+gen puma = fipsstate + puma2k
+destring puma, replace force 
+save "puma2kto12.dta",replace
+clear
+*IPUMS USA
+do usa_00009.do
+drop if year == 1990 
+*To my understanding, 1990 PUMAs are so different from 2000 and 2010 PUMAs that they can't be matched. Therefore it was dropped for now. Working on my own crosswalk. 
+
+* Construct the Estimation Sample
+
+* Step 1: Filter the data according to the specified criteria
+
+* Keep households with exactly one family
+keep if nfams == 1
+
+* Keep households with income exceeding FPL ($11,250)
+keep if hhincome > 11250
+
+* Keep couple households (RELATE == 02 for at least one individual)
+gen couple_hh = (relate == 2)  // Spouse present
+bys serial year: egen has_spouse = max(couple_hh)
+keep if has_spouse == 1
+
+* Identify female spouse younger than 35
+gen female_spouse = (sex == 2 & inlist(relate, 1, 2))
+bys serial year: egen female_age = max(age * female_spouse)
+keep if female_age < 35 
+
+* Lives in state of origin
+gen is_head = (relate == 1)
+gen head_in_state = (statefip == bpl) if is_head
+bysort serial (is_head): egen hh_head_in_state = max(head_in_state)
+keep if hh_head_in_state == 1
+
+* Step 2: Create variables for aggregation                 
+
+* Manufactured home indicator
+gen manufactured_home = (unitsstr == 1)
+
+* New mortgage indicator
+gen new_mortgage = (mortgage == 3 & movedin == 1)
+
+* Married dummy (married spouse present or absent)
+gen married = inlist(marst, 1, 2)
+
+* Child age categories
+gen child_under1 = (relate == 3 & age <= 1)
+gen child_over1  = (relate == 3 & age > 1)
+
+* Identify household head and create flags for male and female spouse/head
+gen male = (inlist(relate, 1, 2) & sex == 1)
+gen female = (inlist(relate, 1, 2) & sex == 2)
+
+* Get characteristics of the male (head or spouse)
+bysort serial year (male): egen male_age       = mean(age)    if male
+bysort serial year (male): egen male_race      = mean(race)   if male
+bysort serial year (male): egen male_ethnicity = mean(hispan) if male
+bysort serial year (male): egen male_educ      = mean(educ)   if male
+
+* Get characteristics of the female (head or spouse)
+bysort serial year (female): egen female_race      = mean(race)   if female
+bysort serial year (female): egen female_ethnicity = mean(hispan) if female
+bysort serial year (female): egen female_educ      = mean(educ)   if female
+
+* Step 3: Collapse to household level  
+
+collapse (mean) manufactured_home new_mortgage hhincome ///
+         (max) married ///
+         (sum) child_under1 child_over1 ///
+         (mean) bedrooms male_age male_race male_ethnicity male_educ ///
+                female_age female_race female_ethnicity female_educ ///
+         (first) hhwt statefip countyfip puma, by(serial year)
+
+gen statefip_str = string(statefip, "%02.0f")
+gen puma_str = string(puma, "%05.0f")
+drop puma
+gen puma = statefip_str + puma_str
+destring puma, replace force
+
+save "household-level-controls.dta", replace 
+drop if year > 2011
+merge m:m puma using "puma2kto12.dta"
+drop puma
+gen puma = fipsstate + puma12
+destring puma, replace force
+collapse (mean) manufactured_home new_mortgage hhincome married child_under1 child_over1 bedrooms male_age male_race male_ethnicity male_educ female_age female_race female_ethnicity female_educ hhwt [aw=puma2ktopuma12allocfactor], by(puma year)
+save "household-level-controls-fixed.dta", replace
+use "household-level-controls.dta", clear
+drop if year < 2011
+append using "household-level-controls-fixed.dta"
+save "household-level-controls-fixed.dta", replace
+
+* STEP 4: Collapse to puma-year level 
+
+collapse (mean) manufactured_home new_mortgage hhincome ///
+                married child_under1 child_over1 ///
+                bedrooms  male_age male_race male_ethnicity male_educ ///
+                female_age female_race female_ethnicity female_educ ///
+          (count) num_households=serial [aw=hhwt], by(puma year)
+
+save "puma-level-controls.dta", replace
+use "puma-level-controls.dta", clear
+
+merge m:1 puma using "puma_treatment_1995.dta"
+drop if _merge!=3
+drop _merge
+
+xtset puma year
+xtreg new_mortgage ib2000.year##i.treat_binary_05 ///
+    hhincome bedrooms male_age male_race male_ethnicity male_educ ///
+    female_age female_race female_ethnicity female_educ ///
+    , cluster(puma)
+estimates store mortgage_controls
+
+xtreg child_under1 ib2000.year##i.treat_binary_05 ///
+    hhincome bedrooms male_age male_race male_ethnicity male_educ ///
+     female_age female_race female_ethnicity female_educ ///
+    , cluster(puma)
+estimates store fertility_controls
+
+clear
+
+*household-level
+use "household-level-controls-fixed.dta", clear
+merge m:1 puma using "puma_treatment_1995.dta"
+drop if _merge!=3
+drop _merge
+
+reg new_mortgage ib2000.year##i.treat_binary_05 ///
+    hhincome bedrooms male_age male_race male_ethnicity male_educ ///
+    female_age female_race female_ethnicity female_educ ///
+    , cluster(puma)
+estimates store mortgage_controls
+
+reg child_under1 ib2000.year##i.treat_binary_05 ///
+    hhincome bedrooms male_age male_race male_ethnicity male_educ ///
+     female_age female_race female_ethnicity female_educ ///
+    , cluster(puma)
+estimates store fertility_controls
+
+coefplot mortgage_controls, keep(*.treat_binary_05) drop(_cons) vertical xline(6, lpattern(dash)) ///
+    title("Event Study: New Mortgage Take-Up (w/ Controls)") ///
+    ytitle("Change in Probability") xlabel(, angle(45))
+
+coefplot fertility_controls, keep(*.treat_binary_05) drop(_cons) vertical xline(6, lpattern(dash)) ///
+    title("Event Study: Fertility (Child <1) (w/ Controls)") ///
+    ytitle("Change in Probability") xlabel(, angle(45))
+
+
+
+
+
